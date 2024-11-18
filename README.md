@@ -8,7 +8,7 @@ All training was done on a single NVIDIA A6000 GPU server with 24 cores and 64 G
 
 - Install dependences via `pip install -r requirements.txt`
 - Pull competition and external data via data_pull.ipynb. Before that, make sure that kaggle package is instulled and configured.
-- Train model on external data via runing NN-base-experiments-old-data.ipynb (also saves model predictions for competition data
+- Train model on external data via runing few last cells in NN-competition-train.ipynb (also saves model predictions for competition data)
 - Train model on competition image data via runing NN-competition-train.ipynb. You need to run it twice, first time with MODEL_NAME = "EVA" and second with MODEL_NAME = "EDGENEXT"
 - Run NN-competition-train.ipynb to train top level GBDT models
 
