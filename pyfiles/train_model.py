@@ -3,6 +3,7 @@ import sys
 import time
 import copy
 import gc
+import argparse
 from pathlib import Path
 
 import torch
@@ -25,6 +26,13 @@ from datasets import prepare_loaders
 from augmentations import get_augmentations
 
 def main():
+    # Parse arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, required=True, 
+                       choices=['EVA', 'EDGENEXT'],
+                       help='Model type to train (EVA or EDGENEXT)')
+    args = parser.parse_args()
+    
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -32,12 +40,25 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"Number of GPUs: {torch.cuda.device_count()}")
 
-    # Configuration
-    MODEL_NAME = "EDGENEXT"  # or "EVA"
+    # Model configurations
+    MODEL_CONFIGS = {
+        'EVA': {
+            'seed': 42,
+            'img_size': 336,
+            'model_name': "eva02_small_patch14_336.mim_in22k_ft_in1k",
+            'model_maker': ISICModel
+        },
+        'EDGENEXT': {
+            'seed': 1997,
+            'img_size': 256,
+            'model_name': "edgenext_base.in21k_ft_in1k",
+            'model_maker': ISICModelEdgnet
+        }
+    }
+
+    # Shared configuration
     CONFIG = {
-        "seed": 42 if MODEL_NAME == 'EVA' else 1997,
         "epochs": 500,
-        "img_size": 336 if MODEL_NAME == 'EVA' else 256,
         "train_batch_size": 32,
         "valid_batch_size": 64,
         "learning_rate": 1e-4,
@@ -52,6 +73,13 @@ def main():
         "device": device
     }
 
+    # Merge model-specific config
+    model_config = MODEL_CONFIGS[args.model]
+    CONFIG.update({
+        'seed': model_config['seed'],
+        'img_size': model_config['img_size']
+    })
+
     # Path setup
     original_root = Path('/data/original')
     data_artifacts = "/data/artifacts"
@@ -63,8 +91,8 @@ def main():
     df_train["path"] = str(original_root / 'train-image/image') + '/' + df_train['isic_id'] + ".jpg"
 
     # Model setup
-    model_name = "eva02_small_patch14_336.mim_in22k_ft_in1k" if MODEL_NAME == 'EVA' else "edgenext_base.in21k_ft_in1k"
-    model_maker = ISICModel if MODEL_NAME == 'EVA' else ISICModelEdgnet
+    model_name = model_config['model_name']
+    model_maker = model_config['model_maker']
     
     # Get augmentations
     data_transforms = get_augmentations(CONFIG)
@@ -106,7 +134,7 @@ def main():
                 seed=CONFIG['seed'])
 
             # Save model
-            model_folder = f"./models/oof_{MODEL_NAME.lower()}_base"
+            model_folder = f"./models/oof_{args.model.lower()}_base"
             os.makedirs(model_folder, exist_ok=True)
             torch.save(model.state_dict(), os.path.join(model_folder, f"model__{fold_n}"))
             results_list.append(np.max(history['Valid Kaggle metric']))
@@ -132,7 +160,7 @@ def main():
 
         # Combine and save all fold results
         fold_df_valid_list = pd.concat(fold_df_valid_list).reset_index(drop=True)
-        fold_df_valid_list.to_parquet(f'/data/artifacts/oof_forecasts_{MODEL_NAME.lower()}_base.parquet')
+        fold_df_valid_list.to_parquet(f'/data/artifacts/oof_forecasts_{args.model.lower()}_base.parquet')
         
         return results_list, fold_df_valid_list
 
