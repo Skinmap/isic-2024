@@ -2,6 +2,7 @@ import random
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import logging
 
 
 def set_seed(random_seed):
@@ -23,6 +24,16 @@ def print_trainable_parameters(model):
         if param.requires_grad:
             trainable_params += param.numel()
     print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}")
+
+def log_trainable_parameters(model, logger: logging.Logger):
+    trainable_params = 0
+    all_param = 0
+    for name, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    logger.info(
         f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}")
 
 

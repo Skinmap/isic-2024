@@ -5,6 +5,7 @@ import copy
 import pandas as pd
 import numpy as np
 import torch
+import logging
 
 from torch import nn
 from torch.optim import lr_scheduler
@@ -163,7 +164,7 @@ def run_training(
         train_loader, valid_loader, model, optimizer, scheduler, device, num_epochs, CONFIG, 
         model_folder=None, model_name="", seed=42, tolerance_max=15, criterion=criterion, 
         test_every_nth_step=get_nth_test_step, 
-        num_classes=1, best_epoch_score_def=-np.inf):
+        num_classes=1, best_epoch_score_def=-np.inf, logger: logging.Logger | None = None):
     set_seed(seed)
     start = time.time()
     best_model_wts = copy.deepcopy(model.state_dict())
@@ -197,7 +198,8 @@ def run_training(
             
             if best_epoch_score <= val_epoch_custom_metric:
                 tolerance = 0
-                print(f"Validation AUROC Improved ({best_epoch_score} ---> {val_epoch_custom_metric})")
+                if logger:
+                    logger.info(f"Validation AUROC Improved ({best_epoch_score} ---> {val_epoch_custom_metric})")
                 best_epoch_score = val_epoch_custom_metric
                 best_model_wts = copy.deepcopy(model.state_dict())
                 if model_folder is not None:
@@ -205,13 +207,13 @@ def run_training(
             else:
                 tolerance += 1
             
-        print()
     
     end = time.time()
     time_elapsed = end - start
-    print('Training complete in {:.0f}h {:.0f}m {:.0f}s'.format(
-        time_elapsed // 3600, (time_elapsed % 3600) // 60, (time_elapsed % 3600) % 60))
-    print("Best AUROC: {:.4f}".format(best_epoch_score))    
+    if logger:
+        logger.info('Training complete in {:.0f}h {:.0f}m {:.0f}s'.format(
+            time_elapsed // 3600, (time_elapsed % 3600) // 60, (time_elapsed % 3600) % 60))
+        logger.info("Best AUROC: {:.4f}".format(best_epoch_score))    
     model.load_state_dict(best_model_wts)
     return model, history
 
