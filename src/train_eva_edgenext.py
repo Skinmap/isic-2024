@@ -20,14 +20,16 @@ from training import fetch_scheduler, valid_one_epoch, run_training
 from datasets import prepare_loaders
 from augmentations import get_augmentations
 
+
 class MetricsLogger:
     """Logger for structured metrics tracking"""
+
     def __init__(self, log_file):
         self.log_file = log_file
         self.metrics = []
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    
+
     def log_epoch(self, fold, epoch, metrics_dict):
         """Log metrics in structured format"""
         entry = {
@@ -37,11 +39,11 @@ class MetricsLogger:
             **metrics_dict
         }
         self.metrics.append(entry)
-        
+
         # Append to JSONL file for easy parsing
         with open(self.log_file, 'a') as f:
             f.write(json.dumps(entry) + '\n')
-    
+
     def log_fold_summary(self, fold, best_metric, total_epochs, training_time):
         """Log fold completion summary"""
         entry = {
@@ -62,35 +64,36 @@ def setup_basic_logging(model_name):
     # Create logger
     logger = logging.getLogger('ISICTraining')
     logger.setLevel(logging.INFO)
-    
+
     # Create logs directory
     os.makedirs('./logs', exist_ok=True)
-    
+
     # File handler - saves all INFO logs
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_handler = logging.FileHandler(f'./logs/{model_name.lower()}_training_{timestamp}.log')
     file_handler.setLevel(logging.INFO)
-    
+
     # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
-    
+
     # Formatter
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
-    
+
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-    
+
     return logger
+
 
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, required=True, 
-                       choices=['EVA', 'EDGENEXT'],
-                       help='Model type to train (EVA or EDGENEXT)')
+    parser.add_argument('--model', type=str, required=True,
+                        choices=['EVA', 'EDGENEXT'],
+                        help='Model type to train (EVA or EDGENEXT)')
     args = parser.parse_args()
 
     logger = setup_basic_logging(args.model)
@@ -98,7 +101,7 @@ def main():
 
     logger.info(f"Starting ISIC 2024 Training Pipeline - Model: {args.model}")
     logger.info("=" * 60)
-    
+
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -126,7 +129,7 @@ def main():
     CONFIG = {
         "epochs": 500,
         "train_batch_size": 32,
-        "valid_batch_size": 64,
+        "valid_batch_size": 32,
         "learning_rate": 1e-4,
         "scheduler": 'CosineAnnealingLR',
         "min_lr": 1e-6,
@@ -149,7 +152,7 @@ def main():
     logger.info(f"Configuration: {json.dumps({k: str(v) for k, v in CONFIG.items()}, indent=2)}")
 
     # Path setup
-    original_root = Path('/home/ubuntu/skinmap/feature-generation/generated_data')
+    original_root = Path('/home/ubuntu/skinmap/isic-feature-generation/feature_generation')
     data_artifacts = "/data/10ktests"
     os.makedirs(data_artifacts, exist_ok=True)
 
@@ -162,8 +165,8 @@ def main():
     positive_cases = df_train['target'].sum()
     total_cases = len(df_train)
     logger.info(f"Dataset loaded - Total samples: {total_cases}")
-    logger.info(f"Positive cases: {positive_cases} ({positive_cases/total_cases*100:.2f}%)")
-    logger.info(f"Negative cases: {total_cases - positive_cases} ({(total_cases-positive_cases)/total_cases*100:.2f}%)")
+    logger.info(f"Positive cases: {positive_cases} ({positive_cases / total_cases * 100:.2f}%)")
+    logger.info(f"Negative cases: {total_cases - positive_cases} ({(total_cases - positive_cases) / total_cases * 100:.2f}%)")
     logger.info(f"Imbalance ratio: {(total_cases - positive_cases) / positive_cases:.2f}:1")
 
     # Model setup
@@ -187,7 +190,7 @@ def main():
 
         for fold_n, (train_index, val_index) in enumerate(tsp.split(df_train, y=df_train.target, groups=df_train[CONFIG["group_col"]])):
             fold_start_time = time.time()
-            logger.info(f"\n{'='*60}")
+            logger.info(f"\n{'=' * 60}")
             logger.info(f"Starting Fold {fold_n + 1}/5")
             logger.info(f"Train samples: {len(train_index)}, Validation samples: {len(val_index)}")
 
@@ -205,8 +208,8 @@ def main():
 
             train_loader, valid_loader = prepare_loaders(fold_df_train, fold_df_valid, CONFIG, data_transforms)
 
-            optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'], 
-                               weight_decay=CONFIG['weight_decay'])
+            optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'],
+                                   weight_decay=CONFIG['weight_decay'])
             scheduler = fetch_scheduler(optimizer, CONFIG)
 
             logger.info("Starting training...")
@@ -215,7 +218,7 @@ def main():
                 model, optimizer, scheduler,
                 device=CONFIG['device'],
                 num_epochs=CONFIG['epochs'],
-                CONFIG=CONFIG, 
+                CONFIG=CONFIG,
                 tolerance_max=20,
                 test_every_nth_step=lambda x: 5,
                 seed=CONFIG['seed'],
@@ -237,14 +240,14 @@ def main():
             # Validation metrics
             logger.info("Running final validation")
             val_epoch_loss, val_epoch_auroc, val_epoch_custom_metric, tmp_predictions_all, tmp_targets_all = valid_one_epoch(
-                model, 
-                dataloader=valid_loader, 
-                device=CONFIG['device'], 
-                epoch=1, 
-                optimizer=optimizer, 
-                criterion=criterion, 
+                model,
+                dataloader=valid_loader,
+                device=CONFIG['device'],
+                epoch=1,
+                optimizer=optimizer,
+                criterion=criterion,
                 use_custom_score=True,
-                metric_function=binary_auroc, 
+                metric_function=binary_auroc,
                 num_classes=1,
                 return_preds=True)
 
@@ -258,7 +261,7 @@ def main():
 
             fold_time = time.time() - fold_start_time
             metrics_logger.log_fold_summary(fold_n, best_metric, len(history['Train Loss']), fold_time)
-            logger.info(f"Fold {fold_n + 1} completed in {fold_time/60:.2f} minutes")
+            logger.info(f"Fold {fold_n + 1} completed in {fold_time / 60:.2f} minutes")
 
         # Combine and save all fold results
         logger.info("\nSaving out-of-fold predictions...")
@@ -268,10 +271,10 @@ def main():
         logger.info(f"OOF predictions saved to {oof_path}")
 
         total_time = time.time() - overall_start_time
-        logger.info("\n" + "="*60)
+        logger.info("\n" + "=" * 60)
         logger.info("TRAINING COMPLETE")
-        logger.info("="*60)
-        logger.info(f"Total training time: {total_time/60:.2f} minutes ({total_time/3600:.2f} hours)")
+        logger.info("=" * 60)
+        logger.info(f"Total training time: {total_time / 60:.2f} minutes ({total_time / 3600:.2f} hours)")
         logger.info(f"Average validation metric: {np.mean(results_list):.4f} ± {np.std(results_list):.4f}")
         logger.info(f"Best fold: {np.argmax(results_list) + 1} (metric: {max(results_list):.4f})")
         logger.info(f"Fold metrics: {[f'{x:.4f}' for x in results_list]}")
@@ -280,6 +283,7 @@ def main():
         train_model()
     except Exception as e:
         logger.error(f"Training failed with error: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
     main()

@@ -45,6 +45,7 @@ import xgboost as xgb
 # LOGGING SETUP
 # ============================================================================
 
+
 def setup_logging():
     """Setup logging configuration"""
     log_dir = Path("logs")
@@ -63,16 +64,17 @@ def setup_logging():
     )
 
     logger = logging.getLogger(__name__)
-    
+
     # Only capture Python warnings, don't redirect stderr
     # This avoids conflicts with tqdm and other libraries
     logging.captureWarnings(True)
     warnings_logger = logging.getLogger('py.warnings')
     warnings_logger.setLevel(logging.WARNING)
-    
+
     logger.info(f"Logging initialized. Log file: {log_file}")
     logger.info("Python warnings will be logged")
     return logger
+
 
 if __name__ == "__main__":
     LOGGER = setup_logging()
@@ -81,22 +83,23 @@ if __name__ == "__main__":
 # CONFIGURATION
 # ============================================================================
 
+
 class Config:
     # Paths
-    root = Path('/data/isic-data/isic-2024-challenge')
-    train_path = root / "train-metadata.csv"
-    test_path = root / 'test-metadata.csv'
-    test_h5 = root / 'test-image.hdf5'
+    root = Path('/home/ubuntu/skinmap/isic-feature-generation/feature_generation')
+    train_path = root / "filtered_train_calculated_umaneo_metrics.csv"
+    test_path = root / 'filtered_test_calculated_umaneo_metrics.csv'
+    test_h5 = root / 'filtered_test_calculated_umaneo_metrics.hdf5'
     subm_path = root / 'sample_submission.csv'
 
     # oof paths
     old_model_preds_path = "/data/models/old-models-predictions/old_data_model_forecast.parquet"
-    eva_oof_path = "/data/models/skin-models-base/skin-models-base/oof_forecasts_eva.parquet"
-    edg_oof_path = "/data/models/skin-models-base/skin-models-base/oof_forecasts_edgenext_base.parquet"
+    eva_oof_path = "/data/10ktests/oof_forecasts_eva_base.parquet"
+    edg_oof_path = "/data/10ktests/oof_forecasts_edgenext_base.parquet"
 
     # Model paths
-    eva_model_path = "/data/models/skin-models-base/skin-models-base"
-    edg_model_path = "/data/models/skin-models-base/skin-models-base"
+    eva_model_path = "/data/10kmodels/oof_eva_base"
+    edg_model_path = "/data/10kmodels/oof_edgenext_base"
     old_model_path = "/data/models/skin-models-base/skin-models-base/ema_small_pretrained"
 
     # Column definitions
@@ -107,7 +110,9 @@ class Config:
     # Training parameters
     seed = 42
     err = 1e-5
-    sampling_ratio = 0.01
+    # TODO: Change back
+    # sampling_ratio = 0.01
+    sampling_ratio = 0.1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Deep learning configs
@@ -136,7 +141,7 @@ class Config:
         'tbp_lv_symm_2axis', 'tbp_lv_symm_2axis_angle', 'tbp_lv_x', 'tbp_lv_y', 'tbp_lv_z',
     ]
 
-    cat_cols = ['sex', 'anatom_site_general', 'tbp_tile_type', 
+    cat_cols = ['sex', 'anatom_site_general', 'tbp_tile_type',
                 'tbp_lv_location', 'tbp_lv_location_simple', 'attribution']
 
     # Columns to drop for final models
@@ -167,6 +172,7 @@ class Config:
         'tbp_lv_minorAxisMM', 'tbp_lv_Hext'
     ]
 
+
 class ModelConfigCB(BaseModel):
     iterations: int = 1000
     learning_rate: float = 0.06936242010150652
@@ -187,8 +193,7 @@ class ModelConfigCB(BaseModel):
     eval_metric: str = 'AUC'
     od_wait: int = 100
     devices: str = '0'
-    bootstrap_type: str ="MVS"
-
+    bootstrap_type: str = "Bernoulli"
 
     def to_catboost_params(self, random_seed=None, cat_features=None):
         params = {
@@ -230,7 +235,6 @@ class ModelConfigCB(BaseModel):
         return params
 
 
-
 # ============================================================================
 # FEATURE ENGINEERING
 # ============================================================================
@@ -241,73 +245,74 @@ def engineer_features(df):
 
     start_time = time.time()
     result = (df
-        .with_columns(
-            pl.col('age_approx').cast(pl.String).replace('NA', np.nan).cast(pl.Float64),
-        )
-        .with_columns(
-            pl.col(pl.Float64).fill_nan(pl.col(pl.Float64).median()),
-        )
-        # Basic engineered features
-        .with_columns(
-            lesion_size_ratio = pl.col('tbp_lv_minorAxisMM') / pl.col('clin_size_long_diam_mm'),
-            lesion_shape_index = pl.col('tbp_lv_areaMM2') / (pl.col('tbp_lv_perimeterMM') ** 2),
-            hue_contrast = (pl.col('tbp_lv_H') - pl.col('tbp_lv_Hext')).abs(),
-            luminance_contrast = (pl.col('tbp_lv_L') - pl.col('tbp_lv_Lext')).abs(),
-            lesion_color_difference = (pl.col('tbp_lv_deltaA') ** 2 + 
-                                     pl.col('tbp_lv_deltaB') ** 2 + 
-                                     pl.col('tbp_lv_deltaL') ** 2).sqrt(),
-            border_complexity = pl.col('tbp_lv_norm_border') + pl.col('tbp_lv_symm_2axis'),
-            color_uniformity = pl.col('tbp_lv_color_std_mean') / (pl.col('tbp_lv_radial_color_std_max') + Config.err),
-        )
-        # More complex features
-        .with_columns(
-            position_distance_3d = (pl.col('tbp_lv_x') ** 2 + 
-                                  pl.col('tbp_lv_y') ** 2 + 
-                                  pl.col('tbp_lv_z') ** 2).sqrt(),
-            perimeter_to_area_ratio = pl.col('tbp_lv_perimeterMM') / pl.col('tbp_lv_areaMM2'),
-            area_to_perimeter_ratio = pl.col('tbp_lv_areaMM2') / pl.col('tbp_lv_perimeterMM'),
-            lesion_visibility_score = pl.col('tbp_lv_deltaLBnorm') + pl.col('tbp_lv_norm_color'),
-            symmetry_border_consistency = pl.col('tbp_lv_symm_2axis') * pl.col('tbp_lv_norm_border'),
-            consistency_symmetry_border = pl.col('tbp_lv_symm_2axis') * pl.col('tbp_lv_norm_border') / 
-                                        (pl.col('tbp_lv_symm_2axis') + pl.col('tbp_lv_norm_border')),
-        )
-        # Additional engineered features (abbreviated for space)
-        .with_columns(
-            color_consistency = pl.col('tbp_lv_stdL') / pl.col('tbp_lv_Lext'),
-            size_age_interaction = pl.col('clin_size_long_diam_mm') * pl.col('age_approx'),
-            log_lesion_area = (pl.col('tbp_lv_areaMM2') + 1).log(),
-            normalized_lesion_size = pl.col('clin_size_long_diam_mm') / pl.col('age_approx'),
-            # ... more features as in original
-        )
-        # Patient-level normalizations
-        .with_columns(
-            ((pl.col(col) - pl.col(col).mean().over('patient_id')) / 
-             (pl.col(col).std().over('patient_id') + Config.err)).alias(f'{col}_patient_norm') 
-            for col in Config.num_cols
-        )
-        # Patient-level aggregations
-        .with_columns(
-            count_per_patient = pl.col('isic_id').count().over('patient_id'),
-            tbp_lv_areaMM2_patient = pl.col('tbp_lv_areaMM2').sum().over('patient_id'),
-            tbp_lv_areaMM2_bp = pl.col('tbp_lv_areaMM2').sum().over(['patient_id', 'anatom_site_general']),
-        )
-        .with_columns(
-            age_normalized_nevi_confidence = pl.col('tbp_lv_nevi_confidence') / pl.col('age_approx'),
-            age_normalized_nevi_confidence_2 = (pl.col('clin_size_long_diam_mm')**2 + pl.col('age_approx')**2).sqrt(),
-            mean_hue_difference = (pl.col('tbp_lv_H') + pl.col('tbp_lv_Hext')) / 2,
-        )
-        .with_columns(
-            pl.col(Config.cat_cols).cast(pl.Categorical),
-        )
-        .to_pandas()
-        .set_index(Config.id_col)
-    )
-    
+              .with_columns(
+                  pl.col('age_approx').cast(pl.String).replace('NA', np.nan).cast(pl.Float64),
+              )
+              .with_columns(
+                  pl.col(pl.Float64).fill_nan(pl.col(pl.Float64).median()),
+              )
+              # Basic engineered features
+              .with_columns(
+                  lesion_size_ratio=pl.col('tbp_lv_minorAxisMM') / pl.col('clin_size_long_diam_mm'),
+                  lesion_shape_index=pl.col('tbp_lv_areaMM2') / (pl.col('tbp_lv_perimeterMM') ** 2),
+                  hue_contrast=(pl.col('tbp_lv_H') - pl.col('tbp_lv_Hext')).abs(),
+                  luminance_contrast=(pl.col('tbp_lv_L') - pl.col('tbp_lv_Lext')).abs(),
+                  lesion_color_difference=(pl.col('tbp_lv_deltaA') ** 2
+                                           + pl.col('tbp_lv_deltaB') ** 2
+                                           + pl.col('tbp_lv_deltaL') ** 2).sqrt(),
+                  border_complexity=pl.col('tbp_lv_norm_border') + pl.col('tbp_lv_symm_2axis'),
+                  color_uniformity=pl.col('tbp_lv_color_std_mean') / (pl.col('tbp_lv_radial_color_std_max') + Config.err),
+              )
+              # More complex features
+              .with_columns(
+                  position_distance_3d=(pl.col('tbp_lv_x') ** 2
+                                        + pl.col('tbp_lv_y') ** 2
+                                        + pl.col('tbp_lv_z') ** 2).sqrt(),
+                  perimeter_to_area_ratio=pl.col('tbp_lv_perimeterMM') / pl.col('tbp_lv_areaMM2'),
+                  area_to_perimeter_ratio=pl.col('tbp_lv_areaMM2') / pl.col('tbp_lv_perimeterMM'),
+                  lesion_visibility_score=pl.col('tbp_lv_deltaLBnorm') + pl.col('tbp_lv_norm_color'),
+                  symmetry_border_consistency=pl.col('tbp_lv_symm_2axis') * pl.col('tbp_lv_norm_border'),
+                  consistency_symmetry_border=pl.col('tbp_lv_symm_2axis') * pl.col('tbp_lv_norm_border')
+                  / (pl.col('tbp_lv_symm_2axis') + pl.col('tbp_lv_norm_border')),
+              )
+              # Additional engineered features (abbreviated for space)
+              .with_columns(
+                  color_consistency=pl.col('tbp_lv_stdL') / pl.col('tbp_lv_Lext'),
+                  size_age_interaction=pl.col('clin_size_long_diam_mm') * pl.col('age_approx'),
+                  log_lesion_area=(pl.col('tbp_lv_areaMM2') + 1).log(),
+                  normalized_lesion_size=pl.col('clin_size_long_diam_mm') / pl.col('age_approx'),
+                  # ... more features as in original
+              )
+              # Patient-level normalizations
+              .with_columns(
+                  ((pl.col(col) - pl.col(col).mean().over('patient_id'))
+                   / (pl.col(col).std().over('patient_id') + Config.err)).alias(f'{col}_patient_norm')
+                  for col in Config.num_cols
+              )
+              # Patient-level aggregations
+              .with_columns(
+                  count_per_patient=pl.col('isic_id').count().over('patient_id'),
+                  tbp_lv_areaMM2_patient=pl.col('tbp_lv_areaMM2').sum().over('patient_id'),
+                  tbp_lv_areaMM2_bp=pl.col('tbp_lv_areaMM2').sum().over(['patient_id', 'anatom_site_general']),
+              )
+              .with_columns(
+                  age_normalized_nevi_confidence=pl.col('tbp_lv_nevi_confidence') / pl.col('age_approx'),
+                  age_normalized_nevi_confidence_2=(pl.col('clin_size_long_diam_mm')**2 + pl.col('age_approx')**2).sqrt(),
+                  mean_hue_difference=(pl.col('tbp_lv_H') + pl.col('tbp_lv_Hext')) / 2,
+              )
+              .with_columns(
+                  pl.col(Config.cat_cols).cast(pl.Categorical),
+              )
+              .to_pandas()
+              .set_index(Config.id_col)
+              )
+
     elapsed_time = time.time() - start_time
     LOGGER.info(f"Feature engineering completed in {elapsed_time:.2f} seconds")
     LOGGER.info(f"Final feature matrix shape: {result.shape}")
 
     return result
+
 
 def load_training_dl_features(df_train):
     """Load pre-computed deep learning features for training data"""
@@ -323,42 +328,78 @@ def load_training_dl_features(df_train):
 
     # Add patient normalizations for old model predictions
     df_train = add_patient_norm(df_train, 'old_set_0', 'old_set_0_m')
-    df_train = add_patient_norm(df_train, 'old_set_1', 'old_set_1_m') 
+    df_train = add_patient_norm(df_train, 'old_set_1', 'old_set_1_m')
     df_train = add_patient_norm(df_train, 'old_set_2', 'old_set_2_m')
 
     # 2. Load EVA model OOF predictions
     LOGGER.info("Loading EVA model OOF predictions...")
     oof_forecasts_eva = pd.read_parquet(Config.eva_oof_path)
-    
+
+    # add tmp_predictions_all__pr (z-score) if the parquet doesn't have it
+    if 'tmp_predictions_all__pr' not in oof_forecasts_eva.columns:
+        print("Calculating 'tmp_predictions_all__pr' (z-score)...")
+
+        # Calculate the mean of predictions for each fold
+        # Using transform() ensures the output is a Series with the same index as the original DataFrame
+        mean_preds = oof_forecasts_eva.groupby('fold_n')['tmp_predictions_all'].transform('mean')
+
+        # Calculate the standard deviation of predictions for each fold
+        std_preds = oof_forecasts_eva.groupby('fold_n')['tmp_predictions_all'].transform('std')
+
+        # Calculate the z-score and create the new column
+        # z = (x - mean) / std
+        oof_forecasts_eva['tmp_predictions_all__pr'] = (oof_forecasts_eva['tmp_predictions_all'] - mean_preds) / std_preds
+
+        # Handle cases where std_preds is 0 to avoid division by zero, filling with 0
+        oof_forecasts_eva['tmp_predictions_all__pr'] = oof_forecasts_eva['tmp_predictions_all__pr'].fillna(0)
+
     # Keep the original format and do patient norm BEFORE merging
     oof_forecasts_eva_clean = oof_forecasts_eva[['isic_id', 'patient_id', 'tmp_predictions_all__pr']].rename(columns={
         'tmp_predictions_all__pr': 'predictions_eva'
     })
-    
+
     # Do patient normalization on the OOF data using ITS patient_id
     oof_forecasts_eva_clean = add_patient_norm(oof_forecasts_eva_clean, 'predictions_eva', 'predictions_eva_m')
-    
+
     # Now merge only the prediction columns (both raw and patient-normalized)
     df_train = df_train.merge(
-        oof_forecasts_eva_clean[['isic_id', 'predictions_eva', 'predictions_eva_m']], 
+        oof_forecasts_eva_clean[['isic_id', 'predictions_eva', 'predictions_eva_m']],
         how="left", on='isic_id'
     )
 
-    # 3. Load EdgeNext model OOF predictions  
+    # 3. Load EdgeNext model OOF predictions
     LOGGER.info("Loading EdgeNext model OOF predictions...")
     oof_forecasts_edgenext = pd.read_parquet(Config.edg_oof_path)
+
+    # add tmp_predictions_all__pr (z-score) if the parquet doesn't have it
+    if 'tmp_predictions_all__pr' not in oof_forecasts_edgenext.columns:
+        print("Calculating 'tmp_predictions_all__pr' (z-score)...")
+
+        # Calculate the mean of predictions for each fold
+        # Using transform() ensures the output is a Series with the same index as the original DataFrame
+        mean_preds = oof_forecasts_edgenext.groupby('fold_n')['tmp_predictions_all'].transform('mean')
+
+        # Calculate the standard deviation of predictions for each fold
+        std_preds = oof_forecasts_edgenext.groupby('fold_n')['tmp_predictions_all'].transform('std')
+
+        # Calculate the z-score and create the new column
+        # z = (x - mean) / std
+        oof_forecasts_edgenext['tmp_predictions_all__pr'] = (oof_forecasts_edgenext['tmp_predictions_all'] - mean_preds) / std_preds
+
+        # Handle cases where std_preds is 0 to avoid division by zero, filling with 0
+        oof_forecasts_edgenext['tmp_predictions_all__pr'] = oof_forecasts_edgenext['tmp_predictions_all__pr'].fillna(0)
 
     # Same approach for EdgeNext
     oof_forecasts_edgenext_clean = oof_forecasts_edgenext[['isic_id', 'patient_id', 'tmp_predictions_all__pr']].rename(columns={
         'tmp_predictions_all__pr': 'predictions_edg'
     })
-    
+
     # Do patient normalization on the OOF data using ITS patient_id
     oof_forecasts_edgenext_clean = add_patient_norm(oof_forecasts_edgenext_clean, 'predictions_edg', 'predictions_edg_m')
-    
+
     # Merge only the prediction columns
     df_train = df_train.merge(
-        oof_forecasts_edgenext_clean[['isic_id', 'predictions_edg', 'predictions_edg_m']], 
+        oof_forecasts_edgenext_clean[['isic_id', 'predictions_edg', 'predictions_edg_m']],
         how="left", on='isic_id'
     )
 
@@ -382,6 +423,7 @@ def add_patient_norm(df, column_name, column_name_new):
 # ============================================================================
 # DEEP LEARNING COMPONENTS
 # ============================================================================
+
 
 class ISICDataset(Dataset):
     def __init__(self, df, file_hdf, transforms=None):
@@ -423,7 +465,7 @@ class ISICModel(nn.Module):
 class ISICModelEdgenext(nn.Module):
     def __init__(self, model_name, num_classes=1, pretrained=True):
         super(ISICModelEdgenext, self).__init__()
-        self.model = timm.create_model(model_name, pretrained=pretrained, 
+        self.model = timm.create_model(model_name, pretrained=pretrained,
                                        num_classes=num_classes, global_pool='avg')
         self.sigmoid = nn.Sigmoid()
 
@@ -474,17 +516,17 @@ def extract_dl_features(test_df, test_h5):
     # Define transforms
     transform_eva = A.Compose([
         A.Resize(Config.eva_config['img_size'], Config.eva_config['img_size']),
-        A.Normalize(mean=[0.4815, 0.4578, 0.4082], 
-                   std=[0.2686, 0.2613, 0.2758], 
-                   max_pixel_value=255.0, p=1.0),
+        A.Normalize(mean=[0.4815, 0.4578, 0.4082],
+                    std=[0.2686, 0.2613, 0.2758],
+                    max_pixel_value=255.0, p=1.0),
         ToTensorV2(),
     ], p=1.)
 
     transform_edg = A.Compose([
         A.Resize(Config.edg_config['img_size'], Config.edg_config['img_size']),
-        A.Normalize(mean=[0.4815, 0.4578, 0.4082], 
-                   std=[0.2686, 0.2613, 0.2758], 
-                   max_pixel_value=255.0, p=1.0),
+        A.Normalize(mean=[0.4815, 0.4578, 0.4082],
+                    std=[0.2686, 0.2613, 0.2758],
+                    max_pixel_value=255.0, p=1.0),
         ToTensorV2(),
     ], p=1.)
 
@@ -493,8 +535,8 @@ def extract_dl_features(test_df, test_h5):
     # 1. Old 3-class model predictions
     logger.info("Extracting features from old 3-class model...")
     dataset = ISICDataset(test_df, test_h5, transforms=transform_eva)
-    dataloader = DataLoader(dataset, batch_size=Config.eva_config['valid_batch_size'], 
-                          num_workers=2, shuffle=False, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=Config.eva_config['valid_batch_size'],
+                            num_workers=2, shuffle=False, pin_memory=True)
 
     model = ISICModel(Config.eva_config['model_name'], pretrained=False, num_classes=3)
     model.load_state_dict(torch.load(Config.old_model_path, weights_only=True))
@@ -512,7 +554,7 @@ def extract_dl_features(test_df, test_h5):
     logger.info("Extracting features from EVA models...")
     eva_predictions = []
     for i in range(5):
-        model_path = os.path.join(Config.eva_model_path, f"eva_model__{i}")
+        model_path = os.path.join(Config.eva_model_path, f"model__{i}")
         model = ISICModel(Config.eva_config['model_name'], pretrained=False, num_classes=1)
         model.load_state_dict(torch.load(model_path, weights_only=True))
         model.to(Config.device)
@@ -526,7 +568,7 @@ def extract_dl_features(test_df, test_h5):
 
     logger.info("Normalizing EVA features...")
     # Normalize EVA predictions
-    oof_eva = pd.read_parquet(f'{Config.eva_model_path}/oof_forecasts_eva.parquet')
+    oof_eva = pd.read_parquet(Config.eva_oof_path)
     mean_pred = oof_eva.groupby('fold_n')['tmp_predictions_all'].mean().iloc[0]
     std_pred = oof_eva.groupby('fold_n')['tmp_predictions_all'].std().iloc[0]
 
@@ -537,45 +579,45 @@ def extract_dl_features(test_df, test_h5):
 
     logger.info("Finished normalizing EVA features")
 
-
     # 3. EdgeNext model predictions
     logger.info("Extracting features from EdgeNext models...")
     dataset = ISICDataset(test_df, test_h5, transforms=transform_edg)
-    dataloader = DataLoader(dataset, batch_size=Config.edg_config['valid_batch_size'], 
-                          num_workers=2, shuffle=False, pin_memory=True)
-    
+    dataloader = DataLoader(dataset, batch_size=Config.edg_config['valid_batch_size'],
+                            num_workers=2, shuffle=False, pin_memory=True)
+
     edg_start_time = time.time()
     edg_predictions = []
     for i in range(5):
-        model_path = os.path.join(Config.edg_model_path, f"edg_model__{i}")
+        model_path = os.path.join(Config.edg_model_path, f"model__{i}")
         model = ISICModelEdgenext('edgenext_base.in21k_ft_in1k', pretrained=False)
         model.load_state_dict(torch.load(model_path, weights_only=True))
         model.to(Config.device)
-        
+
         _, predictions = generate_predictions(model, dataloader, Config.device)
         edg_predictions.append(predictions)
         model.to('cpu')
-    
+
     edg_elapsed = time.time() - edg_start_time
     logger.info(f"Finished extracting EdgeNext features in {edg_elapsed:.2f} seconds")
-    
+
     logger.info("Normalizing EdgeNext predictions")
     # Normalize EdgeNext predictions
-    oof_edg = pd.read_parquet(f'{Config.edg_model_path}/oof_forecasts_edgenext_base.parquet')
+    oof_edg = pd.read_parquet(Config.edg_oof_path)
     mean_pred = oof_edg.groupby('fold_n')['tmp_predictions_all'].mean().iloc[0]
     std_pred = oof_edg.groupby('fold_n')['tmp_predictions_all'].std().iloc[0]
-    
+
     for i in range(5):
         edg_predictions[i] = (edg_predictions[i] - mean_pred) / std_pred
-    
+
     test_df['predictions_edg'] = np.mean(edg_predictions, axis=0)
 
     logger.info("Finished normalizing EdgeNext predictions")
-    
+
     total_elapsed = time.time() - start_time
     logger.info(f"Deep learning feature extraction completed in {total_elapsed:.2f} seconds")
-    
+
     return test_df
+
 
 class OOFNormalizer:
     def __init__(self, oof_path):
@@ -626,7 +668,7 @@ def add_lof_features(df, features):
         return df
 
     outlier_factors = pd.concat(outlier_factors).reset_index(drop=True)
-    df = df.merge(outlier_factors.set_index('isic_id'), 
+    df = df.merge(outlier_factors.set_index('isic_id'),
                   how="left", left_index=True, right_index=True)
     df['of'] = df['of'].fillna(-1)
 
@@ -667,20 +709,22 @@ class GradientBoostingPipeline:
             seed = random_seed * 10 + 17
             cv = StratifiedGroupKFold(5, shuffle=True, random_state=seed)
 
-            for fold, (train_idx, val_idx) in enumerate(cv.split(df_train, 
-                                                                y=df_train.target, 
-                                                                groups=df_train['patient_id'])):
+            for fold, (train_idx, val_idx) in enumerate(cv.split(df_train,
+                                                                 y=df_train.target,
+                                                                 groups=df_train['patient_id'])):
                 X_train = df_train.iloc[train_idx][[c for c in feature_cols if c not in columns_to_drop]]
                 y_train = df_train.iloc[train_idx]['target']
 
-                # Add noise to DL predictions
                 for col in ['predictions_edg', 'predictions_edg_m', 'predictions_eva', 'predictions_eva_m']:
                     if col in X_train.columns:
-                        X_train.loc[:, col] = X_train[col] + np.random.normal(0, 0.1, len(X_train))
+                        noise = np.random.normal(0, 0.1, len(X_train)).astype(X_train[col].dtype)
+                        X_train.loc[:, col] = X_train[col] + noise
 
                 # LightGBM with one-hot encoded features
                 model = Pipeline([
-                    ('sampler_1', RandomOverSampler(sampling_strategy=0.003, random_state=seed)),
+                    # TODO: Change back
+                    # ('sampler_1', RandomOverSampler(sampling_strategy=0.003, random_state=seed)),
+                    ('sampler_1', RandomOverSampler(sampling_strategy=0.05, random_state=seed)),
                     ('sampler_2', RandomUnderSampler(sampling_strategy=Config.sampling_ratio, random_state=seed)),
                     ('classifier', lgb.LGBMClassifier(**self.lgb_params)),
                 ])
@@ -695,16 +739,17 @@ class GradientBoostingPipeline:
         for random_seed in range(1, 10):
             cv = StratifiedGroupKFold(5, shuffle=True, random_state=random_seed)
 
-            for fold, (train_idx, val_idx) in enumerate(cv.split(df_train, 
-                                                                y=df_train.target, 
-                                                                groups=df_train['patient_id'])):
+            for fold, (train_idx, val_idx) in enumerate(cv.split(df_train,
+                                                                 y=df_train.target,
+                                                                 groups=df_train['patient_id'])):
                 X_train = df_train.iloc[train_idx][[c for c in feature_cols if c not in columns_to_drop]]
                 y_train = df_train.iloc[train_idx]['target']
 
                 # Add noise to DL predictions
                 for col in ['predictions_edg', 'predictions_edg_m', 'predictions_eva', 'predictions_eva_m']:
                     if col in X_train.columns:
-                        X_train[col] = X_train[col] + np.random.normal(0, 0.1, len(X_train))
+                        noise = np.random.normal(0, 0.1, len(X_train)).astype(X_train[col].dtype)
+                        X_train[col] = X_train[col] + noise
 
                 cb_params = self.cb_params['base_params'].to_catboost_params(cat_features=Config.cat_cols)
                 cb_params['random_seed'] = random_seed
@@ -712,7 +757,9 @@ class GradientBoostingPipeline:
                 cb_classifier = cb.CatBoostClassifier(**cb_params)
 
                 model = Pipeline([
-                    ('sampler_1', RandomOverSampler(sampling_strategy=0.003, random_state=random_seed)),
+                    # TODO: Change back
+                    # ('sampler_1', RandomOverSampler(sampling_strategy=0.003, random_state=random_seed)),
+                    ('sampler_1', RandomOverSampler(sampling_strategy=0.05, random_state=random_seed)),
                     ('sampler_2', RandomUnderSampler(sampling_strategy=Config.sampling_ratio, random_state=random_seed)),
                     ('classifier', cb_classifier),
                 ])
@@ -725,9 +772,9 @@ class GradientBoostingPipeline:
             seed = random_seed * 10 + 88
             cv = StratifiedGroupKFold(5, shuffle=True, random_state=seed)
 
-            for fold, (train_idx, val_idx) in enumerate(cv.split(df_train, 
-                                                                y=df_train.target, 
-                                                                groups=df_train['patient_id'])):
+            for fold, (train_idx, val_idx) in enumerate(cv.split(df_train,
+                                                                 y=df_train.target,
+                                                                 groups=df_train['patient_id'])):
                 X_train = df_train.iloc[train_idx][[c for c in feature_cols if c not in columns_to_drop]]
                 y_train = df_train.iloc[train_idx]['target']
 
@@ -737,7 +784,9 @@ class GradientBoostingPipeline:
                         X_train[col] = X_train[col] + np.random.normal(0, 0.1, len(X_train))
 
                 model = Pipeline([
-                    ('sampler_1', RandomOverSampler(sampling_strategy=0.003, random_state=seed)),
+                    # TODO: Change back
+                    # ('sampler_1', RandomOverSampler(sampling_strategy=0.003, random_state=seed)),
+                    ('sampler_1', RandomOverSampler(sampling_strategy=0.05, random_state=seed)),
                     ('sampler_2', RandomUnderSampler(sampling_strategy=Config.sampling_ratio, random_state=seed)),
                     ('classifier', xgb.XGBClassifier(**self.xgb_params)),
                 ])
@@ -763,10 +812,11 @@ class GradientBoostingPipeline:
 
         # Average across all model types
         final_predictions = np.mean([predictions['lgb'],
-                                   predictions['cb'],
-                                   predictions['xgb']], axis=0)
+                                     predictions['cb'],
+                                     predictions['xgb']], axis=0)
 
         return final_predictions
+
 
 def clean_data(df, feature_cols, data_type=""):
     """Clean data by handling inf values and missing values"""
@@ -813,6 +863,7 @@ def clean_data(df, feature_cols, data_type=""):
 # MAIN PIPELINE
 # ============================================================================
 
+
 def main():
     LOGGER.info("ISIC 2024 First Place Solution")
     LOGGER.info("=" * 50)
@@ -821,7 +872,7 @@ def main():
     LOGGER.info("\n1. Loading and engineering features...")
     df_train = engineer_features(pl.read_csv(Config.train_path))
     df_test = engineer_features(pl.read_csv(Config.test_path))
-    df_subm = pd.read_csv(Config.subm_path, index_col=Config.id_col)
+    # df_subm = pd.read_csv(Config.subm_path, index_col=Config.id_col)
 
     # One-hot encode categorical features
     LOGGER.info("\n2. One-hot encoding categorical features...")
@@ -835,7 +886,7 @@ def main():
 
     # Update feature columns
     feature_cols = [
-        col for col in df_train.columns 
+        col for col in df_train.columns
         if df_train[col].dtype != 'object' and col != Config.target_col
     ]
 
@@ -847,9 +898,9 @@ def main():
 
     # Extract test features
     test_dl_features = extract_dl_features(df_test.reset_index(), Config.test_h5)
-    df_test = df_test.merge(test_dl_features[['isic_id', 'old_set_0', 'old_set_1', 'old_set_2', 
-                                             'predictions_eva', 'predictions_edg']], 
-                           on='isic_id', how='left')
+    df_test = df_test.merge(test_dl_features[['isic_id', 'old_set_0', 'old_set_1', 'old_set_2',
+                                             'predictions_eva', 'predictions_edg']],
+                            on='isic_id', how='left')
 
     # Add patient normalizations for test DL features
     df_test = add_patient_norm(df_test, 'old_set_0', 'old_set_0_m')
@@ -858,19 +909,22 @@ def main():
     df_test = add_patient_norm(df_test, 'predictions_eva', 'predictions_eva_m')
     df_test = add_patient_norm(df_test, 'predictions_edg', 'predictions_edg_m')
 
-    # Add LOF features
-    LOGGER.info("\n4. Adding Local Outlier Factor features...")
+    # Update feature columns with new features
+    dl_features = ['old_set_0', 'old_set_1', 'old_set_2', 'old_set_0_m', 'old_set_1_m', 'old_set_2_m',
+                   'predictions_eva', 'predictions_eva_m', 'predictions_edg', 'predictions_edg_m']
+    feature_cols.extend(dl_features)
+
+    LOGGER.info("\n4. Cleaning data...")
+    df_train = clean_data(df_train, feature_cols, "training")
+    df_test = clean_data(df_test, feature_cols, "test")
+
+    # Add LOF features (after cleaning data to remove NaN values)
+    LOGGER.info("\n5. Adding Local Outlier Factor features...")
     df_train = add_lof_features(df_train, Config.lof_features)
     df_test = add_lof_features(df_test, Config.lof_features)
 
-    # Update feature columns with new features
-    dl_features = ['old_set_0', 'old_set_1', 'old_set_2', 'old_set_0_m', 'old_set_1_m', 'old_set_2_m',
-                   'predictions_eva', 'predictions_eva_m', 'predictions_edg', 'predictions_edg_m', 'of']
-    feature_cols.extend(dl_features)
-
-    LOGGER.info("\n5. Cleaning data...")
-    df_train = clean_data(df_train, feature_cols, "training")
-    df_test = clean_data(df_test, feature_cols, "test")
+    # Add 'of' feature to feature columns
+    feature_cols.append('of')
 
     cb_config = ModelConfigCB(
         iterations=200,
@@ -936,13 +990,18 @@ def main():
     LOGGER.info("\n7. Generating final predictions...")
     predictions = gb_pipeline.predict(df_test, feature_cols, columns_to_drop=Config.columns_to_drop)
 
-    # For demonstration, using random predictions
-    # predictions = np.random.rand(len(df_test))
-
     # Save submission
-    df_subm['target'] = predictions
+    df_subm = pd.DataFrame({
+        'isic_id': df_test["isic_id"],
+        'target': df_test['target'],
+        'prediction': predictions
+    })
+    df_subm.set_index(Config.id_col, inplace=True)
     df_subm.to_csv('submission.csv')
+
+    auc_score = custom_metric(df_subm["prediction"], df_subm["target"])
     LOGGER.info("\nSubmission saved to submission.csv")
+    LOGGER.info(f"\nAUROC Score: {auc_score}")
     LOGGER.info(f"Shape: {df_subm.shape}")
     LOGGER.info(df_subm.head())
 

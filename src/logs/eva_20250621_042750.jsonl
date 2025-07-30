@@ -1,5 +1,0 @@
-{"timestamp": "2025-06-21T13:01:16.798603", "event": "fold_complete", "fold": 0, "best_metric": 0.1558371130305609, "total_epochs": 33, "training_time_seconds": 30801.494133472443, "training_time_minutes": 513.3582355578741}
-{"timestamp": "2025-06-22T04:39:33.565677", "event": "fold_complete", "fold": 1, "best_metric": 0.1489629637469483, "total_epochs": 50, "training_time_seconds": 56296.694553375244, "training_time_minutes": 938.2782425562541}
-{"timestamp": "2025-06-22T12:21:46.359696", "event": "fold_complete", "fold": 2, "best_metric": 0.17434168975961842, "total_epochs": 27, "training_time_seconds": 27732.722853660583, "training_time_minutes": 462.21204756100974}
-{"timestamp": "2025-06-22T19:59:48.893258", "event": "fold_complete", "fold": 3, "best_metric": 0.14309026274798925, "total_epochs": 25, "training_time_seconds": 27482.46199464798, "training_time_minutes": 458.041033244133}
-{"timestamp": "2025-06-23T06:05:41.610258", "event": "fold_complete", "fold": 4, "best_metric": 0.16575692306964632, "total_epochs": 34, "training_time_seconds": 36352.645926237106, "training_time_minutes": 605.8774321039517}

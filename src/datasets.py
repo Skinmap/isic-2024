@@ -197,7 +197,7 @@ class ISICDatasetSamplerMulticlass(Dataset):
 
 
 
-def prepare_loaders(df_train, df_valid, CONFIG, data_transforms, data_loader_base=ISICDatasetSampler, weight_adg=1, num_workers=10):
+def prepare_loaders(df_train, df_valid, CONFIG, data_transforms, data_loader_base=ISICDatasetSampler, weight_adg=1, num_workers=4):
     
     train_dataset = data_loader_base(df_train, transforms=data_transforms["train"], weight_adg=weight_adg)
     valid_dataset = ISICDatasetSimple(df_valid, transforms=data_transforms["valid"])

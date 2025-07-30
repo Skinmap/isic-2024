@@ -53,26 +53,26 @@ def criterion(outputs, targets):
 
 def train_one_epoch(model, optimizer, scheduler, dataloader, device, epoch, CONFIG, criterion=criterion, metric_function=binary_auroc, 
                 num_classes=1):
-    
+
     model.train()
-    
+
     dataset_size = 0
     running_loss = 0.0
     running_auroc  = 0.0
-    
+
     bar = tqdm(enumerate(dataloader), total=len(dataloader))
     for step, data in bar:
         images = data['image'].to(device, dtype=torch.float)
         targets = data['target'].to(device, dtype=torch.float)
-        
+
         batch_size = images.size(0)
-        
+
         outputs = model(images).squeeze()
         loss = criterion(outputs, targets)
         loss = loss / CONFIG['n_accumulate']
-            
+
         loss.backward()
-    
+
         if (step + 1) % CONFIG['n_accumulate'] == 0:
             optimizer.step()
             optimizer.zero_grad()
@@ -87,14 +87,14 @@ def train_one_epoch(model, optimizer, scheduler, dataloader, device, epoch, CONF
         running_loss += (loss.item() * batch_size)
         running_auroc  += (auroc * batch_size)
         dataset_size += batch_size
-        
+
         epoch_loss = running_loss / dataset_size
         epoch_auroc = running_auroc / dataset_size
-        
+
         bar.set_postfix(Epoch=epoch, Train_Loss=epoch_loss, Train_Auroc=epoch_auroc,
                         LR=optimizer.param_groups[0]['lr'])
     gc.collect()
-    
+
     return epoch_loss, epoch_auroc
 
 

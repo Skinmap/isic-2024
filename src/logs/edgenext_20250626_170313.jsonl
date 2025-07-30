@@ -1,2 +1,0 @@
-{"timestamp": "2025-06-26T17:10:24.015626", "event": "fold_complete", "fold": 0, "best_metric": 0.1933333333333333, "total_epochs": 45, "training_time_seconds": 430.49309825897217, "training_time_minutes": 7.17488497098287}
-{"timestamp": "2025-06-26T17:14:17.558115", "event": "fold_complete", "fold": 1, "best_metric": 0.11097560975609753, "total_epochs": 24, "training_time_seconds": 233.54183220863342, "training_time_minutes": 3.8923638701438903}
