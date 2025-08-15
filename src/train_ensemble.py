@@ -19,6 +19,8 @@ import logging
 import warnings
 import sys
 import time
+import pickle
+import joblib
 
 # Sklearn imports
 from sklearn.model_selection import StratifiedGroupKFold
@@ -46,13 +48,13 @@ import xgboost as xgb
 # ============================================================================
 
 
-def setup_logging():
+def setup_logging(run_tags="default"):
     """Setup logging configuration"""
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"train_ensemble_{timestamp}.log"
+    log_file = log_dir / f"train_ensemble_{run_tags}_{timestamp}.log"
 
     logging.basicConfig(
         level=logging.INFO,
@@ -77,7 +79,8 @@ def setup_logging():
 
 
 if __name__ == "__main__":
-    LOGGER = setup_logging()
+    # LOGGER will be initialized in main() after Config is defined
+    pass
 
 # ============================================================================
 # CONFIGURATION
@@ -85,22 +88,45 @@ if __name__ == "__main__":
 
 
 class Config:
+    # Run tags for naming files
+    run_tags = "full-dataset"  # Change this to tag your runs (e.g., "10k-models", "full-dataset", "experiment-v2")
+
+    # Model save paths
+    model_save_dir = Path("/data/models") / run_tags
+
     # Paths
     root = Path('/home/ubuntu/skinmap/isic-feature-generation/feature_generation')
-    train_path = root / "filtered_train_calculated_umaneo_metrics.csv"
+    train_path = root / "umaneo_100k_man_calculated_metrics.csv"
+
     test_path = root / 'filtered_test_calculated_umaneo_metrics.csv'
     test_h5 = root / 'filtered_test_calculated_umaneo_metrics.hdf5'
     subm_path = root / 'sample_submission.csv'
 
-    # oof paths
+    # oof paths - using 10k dataset parquets
     old_model_preds_path = "/data/models/old-models-predictions/old_data_model_forecast.parquet"
-    eva_oof_path = "/data/10ktests/oof_forecasts_eva_base.parquet"
-    edg_oof_path = "/data/10ktests/oof_forecasts_edgenext_base.parquet"
+    # Full dataset paths
+    eva_oof_path = "/data/models/skin-models-base/skin-models-base/oof_forecasts_eva.parquet"
+    edg_oof_path = "/data/models/skin-models-base/skin-models-base/oof_forecasts_edgenext_base.parquet"
+    # 10k dataset paths:
+    # eva_oof_path = "/data/10ktests/oof_forecasts_eva_base.parquet"
+    # edg_oof_path = "/data/10ktests/oof_forecasts_edgenext_base.parquet"
 
-    # Model paths
-    eva_model_path = "/data/10kmodels/oof_eva_base"
-    edg_model_path = "/data/10kmodels/oof_edgenext_base"
+    # Model paths - using 10k dataset models
+    # Full dataset paths
+    eva_model_path = "/data/models/skin-models-base/skin-models-base"
+    edg_model_path = "/data/models/skin-models-base/skin-models-base"
+    # 10k dataset paths:
+    # eva_model_path = "/data/10kmodels/oof_eva_base"
+    # edg_model_path = "/data/10kmodels/oof_edgenext_base"
     old_model_path = "/data/models/skin-models-base/skin-models-base/ema_small_pretrained"
+
+    # Model naming patterns
+    # Full dataset patterns
+    eva_model_pattern = "eva_model__{}"
+    edg_model_pattern = "edg_model__{}"
+    # 10k dataset patterns:
+    # eva_model_pattern = "model__{}"
+    # edg_model_pattern = "model__{}"
 
     # Column definitions
     id_col = 'isic_id'
@@ -115,17 +141,20 @@ class Config:
     sampling_ratio = 0.1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Data leakage prevention
+    prevent_data_leakage = True
+
     # Deep learning configs
     eva_config = {
         "img_size": 336,
         "model_name": 'eva02_small_patch14_336.mim_in22k_ft_in1k',
-        "valid_batch_size": 64,
+        "valid_batch_size": 128,
     }
 
     edg_config = {
         "img_size": 256,
         "model_name": 'edgenext_base.in21k_ft_in1k',
-        "valid_batch_size": 64,
+        "valid_batch_size": 128,
     }
 
     # Feature columns
@@ -314,8 +343,115 @@ def engineer_features(df):
     return result
 
 
-def load_training_dl_features(df_train):
-    """Load pre-computed deep learning features for training data"""
+def extract_leak_free_training_features(df_train, leakage_checker):
+    """
+    Load pre-computed deep learning features for training data with data leakage prevention.
+    Only uses OOF predictions for each sample to prevent data leakage.
+    """
+    LOGGER.info("Loading leak-free training deep learning features...")
+
+    # Reset index to make isic_id a column for merging
+    df_train = df_train.reset_index()
+
+    # 1. Load old 3-class model predictions (no fold structure currently)
+    LOGGER.info("Loading old 3-class model predictions...")
+    old_data_model_preds = pd.read_parquet(Config.old_model_preds_path)
+    df_train = df_train.merge(old_data_model_preds, how="left", on="isic_id")
+
+    # Add patient normalizations for old model predictions
+    df_train = add_patient_norm(df_train, 'old_set_0', 'old_set_0_m')
+    df_train = add_patient_norm(df_train, 'old_set_1', 'old_set_1_m')
+    df_train = add_patient_norm(df_train, 'old_set_2', 'old_set_2_m')
+
+    # 2. Load EVA model OOF predictions with leakage prevention (OPTIMIZED)
+    LOGGER.info("Loading EVA model OOF predictions with leakage prevention...")
+    oof_forecasts_eva = pd.read_parquet(Config.eva_oof_path)
+
+    # Ensure z-score column exists
+    if 'tmp_predictions_all__pr' not in oof_forecasts_eva.columns:
+        LOGGER.info("Calculating z-scores for EVA predictions...")
+        mean_preds = oof_forecasts_eva.groupby('fold_n')['tmp_predictions_all'].transform('mean')
+        std_preds = oof_forecasts_eva.groupby('fold_n')['tmp_predictions_all'].transform('std')
+        oof_forecasts_eva['tmp_predictions_all__pr'] = (oof_forecasts_eva['tmp_predictions_all'] - mean_preds) / std_preds
+        oof_forecasts_eva['tmp_predictions_all__pr'] = oof_forecasts_eva['tmp_predictions_all__pr'].fillna(0)
+
+    # VECTORIZED APPROACH: Filter OOF data to only include samples that are in training set
+    LOGGER.info("Filtering EVA OOF predictions for training samples...")
+    train_isic_ids = set(df_train['isic_id'])
+    oof_forecasts_eva_filtered = oof_forecasts_eva[oof_forecasts_eva['isic_id'].isin(train_isic_ids)].copy()
+
+    # Rename prediction column and select needed columns
+    eva_clean_df = oof_forecasts_eva_filtered[['isic_id', 'patient_id', 'tmp_predictions_all__pr']].rename(columns={
+        'tmp_predictions_all__pr': 'predictions_eva'
+    })
+
+    # Add patient normalization
+    eva_clean_df = add_patient_norm(eva_clean_df, 'predictions_eva', 'predictions_eva_m')
+
+    # Merge with training data
+    df_train = df_train.merge(
+        eva_clean_df[['isic_id', 'predictions_eva', 'predictions_eva_m']],
+        how="left", on='isic_id'
+    )
+
+    # Log statistics
+    samples_with_predictions = len(eva_clean_df)
+    samples_without_predictions = len(df_train) - len(eva_clean_df)
+    LOGGER.info(f"EVA: {samples_with_predictions} samples with leak-free predictions, "
+                f"{samples_without_predictions} samples without predictions")
+
+    # 3. Load EdgeNext model OOF predictions with leakage prevention (OPTIMIZED)
+    LOGGER.info("Loading EdgeNext model OOF predictions with leakage prevention...")
+    oof_forecasts_edgenext = pd.read_parquet(Config.edg_oof_path)
+
+    # Ensure z-score column exists
+    if 'tmp_predictions_all__pr' not in oof_forecasts_edgenext.columns:
+        LOGGER.info("Calculating z-scores for EdgeNext predictions...")
+        mean_preds = oof_forecasts_edgenext.groupby('fold_n')['tmp_predictions_all'].transform('mean')
+        std_preds = oof_forecasts_edgenext.groupby('fold_n')['tmp_predictions_all'].transform('std')
+        oof_forecasts_edgenext['tmp_predictions_all__pr'] = (oof_forecasts_edgenext['tmp_predictions_all'] - mean_preds) / std_preds
+        oof_forecasts_edgenext['tmp_predictions_all__pr'] = oof_forecasts_edgenext['tmp_predictions_all__pr'].fillna(0)
+
+    # VECTORIZED APPROACH: Filter OOF data to only include samples that are in training set
+    LOGGER.info("Filtering EdgeNext OOF predictions for training samples...")
+    oof_forecasts_edgenext_filtered = oof_forecasts_edgenext[oof_forecasts_edgenext['isic_id'].isin(train_isic_ids)].copy()
+
+    # Rename prediction column and select needed columns
+    edg_clean_df = oof_forecasts_edgenext_filtered[['isic_id', 'patient_id', 'tmp_predictions_all__pr']].rename(columns={
+        'tmp_predictions_all__pr': 'predictions_edg'
+    })
+
+    # Add patient normalization
+    edg_clean_df = add_patient_norm(edg_clean_df, 'predictions_edg', 'predictions_edg_m')
+
+    # Merge with training data
+    df_train = df_train.merge(
+        edg_clean_df[['isic_id', 'predictions_edg', 'predictions_edg_m']],
+        how="left", on='isic_id'
+    )
+
+    # Log statistics
+    samples_with_predictions = len(edg_clean_df)
+    samples_without_predictions = len(df_train) - len(edg_clean_df)
+    LOGGER.info(f"EdgeNext: {samples_with_predictions} samples with leak-free predictions, "
+                f"{samples_without_predictions} samples without predictions")
+
+    # Set index back to isic_id
+    df_train = df_train.set_index('isic_id')
+
+    LOGGER.info("Finished loading leak-free training deep learning features")
+    return df_train
+
+
+def load_training_dl_features(df_train, leakage_checker=None):
+    """
+    Load pre-computed deep learning features for training data.
+    Uses leak-free extraction if data leakage prevention is enabled.
+    """
+    if Config.prevent_data_leakage and leakage_checker is not None and leakage_checker.should_prevent_leakage():
+        LOGGER.info("Using leak-free training feature extraction")
+        return extract_leak_free_training_features(df_train, leakage_checker)
+
     LOGGER.info("Loading pre-computed training deep learning features...")
 
     # Reset index to make isic_id a column for merging
@@ -489,7 +625,15 @@ def generate_predictions(model, dataloader, device):
         images = data['image'].to(device, dtype=torch.float)
         targets = data['target'].to(device, dtype=torch.float)
 
-        outputs = model(images).squeeze()
+        outputs = model(images)
+
+        # Handle squeezing more carefully to avoid 0-dimensional arrays
+        if outputs.dim() > 1:
+            outputs = outputs.squeeze(-1)  # Only squeeze the last dimension
+
+        # Ensure outputs is at least 1D
+        if outputs.dim() == 0:
+            outputs = outputs.unsqueeze(0)
 
         predictions_all.append(outputs.cpu().numpy())
         targets_all.append(targets.cpu().numpy())
@@ -506,8 +650,218 @@ def generate_predictions(model, dataloader, device):
     return targets_all, predictions_all
 
 
-def extract_dl_features(test_df, test_h5):
-    """Extract features from all deep learning models"""
+def extract_leak_free_test_features(test_df, test_h5, leakage_checker):
+    """
+    Extract features from deep learning models with data leakage prevention.
+    Uses only the specific fold model where each sample was OOF during training.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting leak-free deep learning feature extraction for {len(test_df)} samples")
+
+    start_time = time.time()
+
+    # Define transforms
+    transform_eva = A.Compose([
+        A.Resize(Config.eva_config['img_size'], Config.eva_config['img_size']),
+        A.Normalize(mean=[0.4815, 0.4578, 0.4082],
+                    std=[0.2686, 0.2613, 0.2758],
+                    max_pixel_value=255.0, p=1.0),
+        ToTensorV2(),
+    ], p=1.)
+
+    transform_edg = A.Compose([
+        A.Resize(Config.edg_config['img_size'], Config.edg_config['img_size']),
+        A.Normalize(mean=[0.4815, 0.4578, 0.4082],
+                    std=[0.2686, 0.2613, 0.2758],
+                    max_pixel_value=255.0, p=1.0),
+        ToTensorV2(),
+    ], p=1.)
+
+    test_df['target'] = 0
+
+    # 1. Old 3-class model predictions (no fold structure)
+    logger.info("Extracting features from old 3-class model...")
+    dataset = ISICDataset(test_df, test_h5, transforms=transform_eva)
+    dataloader = DataLoader(dataset, batch_size=Config.eva_config['valid_batch_size'],
+                            num_workers=2, shuffle=False, pin_memory=True)
+
+    model = ISICModel(Config.eva_config['model_name'], pretrained=False, num_classes=3)
+    model.load_state_dict(torch.load(Config.old_model_path, weights_only=True))
+    model.to(Config.device)
+
+    _, predictions = generate_predictions(model, dataloader, Config.device)
+    test_df['old_set_0'] = predictions[:, 0]
+    test_df['old_set_1'] = predictions[:, 1]
+    test_df['old_set_2'] = predictions[:, 2]
+    model.to('cpu')
+    logger.info("Finished extracting old 3-class model features")
+
+    # 2. EVA model predictions with leak prevention
+    logger.info("Extracting leak-free features from EVA models...")
+    eva_start_time = time.time()
+
+    # Load all EVA models
+    eva_models = {}
+    for i in tqdm(range(5), desc="Loading EVA models"):
+        model_path = os.path.join(Config.eva_model_path, Config.eva_model_pattern.format(i))
+        model = ISICModel(Config.eva_config['model_name'], pretrained=False, num_classes=1)
+        model.load_state_dict(torch.load(model_path, weights_only=True))
+        model.to(Config.device)
+        eva_models[i] = model
+
+    # Get normalization stats
+    oof_eva = pd.read_parquet(Config.eva_oof_path)
+    fold_stats = oof_eva.groupby('fold_n')['tmp_predictions_all'].agg(['mean', 'std'])
+
+    # Generate predictions sample by sample using only the appropriate fold model
+    eva_predictions = []
+    samples_with_leak_free_pred = 0
+    samples_with_fallback_pred = 0
+
+    dataset = ISICDataset(test_df, test_h5, transforms=transform_eva)
+
+    for idx, data in tqdm(enumerate(dataset), total=len(dataset), desc="EVA inference"):
+        isic_id = test_df.iloc[idx]['isic_id']
+        valid_folds = leakage_checker.get_valid_models_for_sample(isic_id, 'eva')
+
+        if valid_folds is not None:
+            # Use only the specific fold model for this sample
+            fold_to_use = valid_folds[0]
+            model = eva_models[fold_to_use]
+
+            # Run inference for this single sample
+            images = data['image'].unsqueeze(0).to(Config.device, dtype=torch.float)
+            with torch.inference_mode():
+                model.eval()
+                output = model(images).squeeze().cpu().numpy()
+
+            # Normalize using the stats from the specific fold
+            mean_pred = fold_stats.loc[fold_to_use, 'mean']
+            std_pred = fold_stats.loc[fold_to_use, 'std']
+            normalized_pred = (output - mean_pred) / std_pred
+
+            eva_predictions.append(normalized_pred)
+            samples_with_leak_free_pred += 1
+
+        else:
+            # Fallback: use all models (backward compatibility)
+            fold_preds = []
+            for fold_n, model in eva_models.items():
+                images = data['image'].unsqueeze(0).to(Config.device, dtype=torch.float)
+                with torch.inference_mode():
+                    model.eval()
+                    output = model(images).squeeze().cpu().numpy()
+
+                # Normalize using the stats from this fold
+                mean_pred = fold_stats.loc[fold_n, 'mean']
+                std_pred = fold_stats.loc[fold_n, 'std']
+                normalized_pred = (output - mean_pred) / std_pred
+                fold_preds.append(normalized_pred)
+
+            # Average across all folds
+            eva_predictions.append(np.mean(fold_preds))
+            samples_with_fallback_pred += 1
+
+    test_df['predictions_eva'] = eva_predictions
+
+    # Clean up EVA models
+    for model in eva_models.values():
+        model.to('cpu')
+
+    eva_elapsed = time.time() - eva_start_time
+    logger.info(f"EVA: {samples_with_leak_free_pred} leak-free, {samples_with_fallback_pred} fallback predictions in {eva_elapsed:.2f}s")
+
+    # 3. EdgeNext model predictions with leak prevention
+    logger.info("Extracting leak-free features from EdgeNext models...")
+    edg_start_time = time.time()
+
+    # Load all EdgeNext models
+    edg_models = {}
+    for i in tqdm(range(5), desc="Loading EdgeNext models"):
+        model_path = os.path.join(Config.edg_model_path, Config.edg_model_pattern.format(i))
+        model = ISICModelEdgenext('edgenext_base.in21k_ft_in1k', pretrained=False)
+        model.load_state_dict(torch.load(model_path, weights_only=True))
+        model.to(Config.device)
+        edg_models[i] = model
+
+    # Get normalization stats
+    oof_edg = pd.read_parquet(Config.edg_oof_path)
+    fold_stats = oof_edg.groupby('fold_n')['tmp_predictions_all'].agg(['mean', 'std'])
+
+    # Generate predictions sample by sample using only the appropriate fold model
+    edg_predictions = []
+    samples_with_leak_free_pred = 0
+    samples_with_fallback_pred = 0
+
+    dataset = ISICDataset(test_df, test_h5, transforms=transform_edg)
+
+    for idx, data in tqdm(enumerate(dataset), total=len(dataset), desc="EdgeNext inference"):
+        isic_id = test_df.iloc[idx]['isic_id']
+        valid_folds = leakage_checker.get_valid_models_for_sample(isic_id, 'edg')
+
+        if valid_folds is not None:
+            # Use only the specific fold model for this sample
+            fold_to_use = valid_folds[0]
+            model = edg_models[fold_to_use]
+
+            # Run inference for this single sample
+            images = data['image'].unsqueeze(0).to(Config.device, dtype=torch.float)
+            with torch.inference_mode():
+                model.eval()
+                output = model(images).squeeze().cpu().numpy()
+
+            # Normalize using the stats from the specific fold
+            mean_pred = fold_stats.loc[fold_to_use, 'mean']
+            std_pred = fold_stats.loc[fold_to_use, 'std']
+            normalized_pred = (output - mean_pred) / std_pred
+
+            edg_predictions.append(normalized_pred)
+            samples_with_leak_free_pred += 1
+
+        else:
+            # Fallback: use all models (backward compatibility)
+            fold_preds = []
+            for fold_n, model in edg_models.items():
+                images = data['image'].unsqueeze(0).to(Config.device, dtype=torch.float)
+                with torch.inference_mode():
+                    model.eval()
+                    output = model(images).squeeze().cpu().numpy()
+
+                # Normalize using the stats from this fold
+                mean_pred = fold_stats.loc[fold_n, 'mean']
+                std_pred = fold_stats.loc[fold_n, 'std']
+                normalized_pred = (output - mean_pred) / std_pred
+                fold_preds.append(normalized_pred)
+
+            # Average across all folds
+            edg_predictions.append(np.mean(fold_preds))
+            samples_with_fallback_pred += 1
+
+    test_df['predictions_edg'] = edg_predictions
+
+    # Clean up EdgeNext models
+    for model in edg_models.values():
+        model.to('cpu')
+
+    edg_elapsed = time.time() - edg_start_time
+    logger.info(f"EdgeNext: {samples_with_leak_free_pred} leak-free, {samples_with_fallback_pred} fallback predictions in {edg_elapsed:.2f}s")
+
+    total_elapsed = time.time() - start_time
+    logger.info(f"Leak-free deep learning feature extraction completed in {total_elapsed:.2f} seconds")
+
+    return test_df
+
+
+def extract_dl_features(test_df, test_h5, leakage_checker=None):
+    """
+    Extract features from all deep learning models.
+    Uses leak-free extraction if data leakage prevention is enabled.
+    """
+    if Config.prevent_data_leakage and leakage_checker is not None and leakage_checker.should_prevent_leakage():
+        logger = logging.getLogger(__name__)
+        logger.info("Using leak-free test feature extraction")
+        return extract_leak_free_test_features(test_df, test_h5, leakage_checker)
+
     logger = logging.getLogger(__name__)
     logger.info(f"Starting deep learning feature extraction for {len(test_df)} samples")
 
@@ -547,14 +901,14 @@ def extract_dl_features(test_df, test_h5):
     test_df['old_set_1'] = predictions[:, 1]
     test_df['old_set_2'] = predictions[:, 2]
     model.to('cpu')
-    logger.info(f"Finished extracting old 3-class model features")
+    logger.info("Finished extracting old 3-class model features")
 
     # 2. EVA model predictions
     eva_start_time = time.time()
     logger.info("Extracting features from EVA models...")
     eva_predictions = []
-    for i in range(5):
-        model_path = os.path.join(Config.eva_model_path, f"model__{i}")
+    for i in tqdm(range(5), desc="EVA model inference"):
+        model_path = os.path.join(Config.eva_model_path, Config.eva_model_pattern.format(i))
         model = ISICModel(Config.eva_config['model_name'], pretrained=False, num_classes=1)
         model.load_state_dict(torch.load(model_path, weights_only=True))
         model.to(Config.device)
@@ -587,8 +941,8 @@ def extract_dl_features(test_df, test_h5):
 
     edg_start_time = time.time()
     edg_predictions = []
-    for i in range(5):
-        model_path = os.path.join(Config.edg_model_path, f"model__{i}")
+    for i in tqdm(range(5), desc="EdgeNext model inference"):
+        model_path = os.path.join(Config.edg_model_path, Config.edg_model_pattern.format(i))
         model = ISICModelEdgenext('edgenext_base.in21k_ft_in1k', pretrained=False)
         model.load_state_dict(torch.load(model_path, weights_only=True))
         model.to(Config.device)
@@ -637,6 +991,128 @@ class OOFNormalizer:
         return (predictions - mean) / std
 
 
+class DataLeakageChecker:
+    """
+    Prevents data leakage by tracking which samples were in which folds
+    and ensuring only OOF predictions are used for each sample.
+    """
+
+    def __init__(self, eva_oof_path=None, edg_oof_path=None, old_model_path=None):
+        self.logger = logging.getLogger(__name__)
+        self.eva_fold_map = {}
+        self.edg_fold_map = {}
+        self.old_fold_map = {}
+
+        # Load fold mappings from OOF parquets
+        if eva_oof_path and os.path.exists(eva_oof_path):
+            self._load_fold_mapping('eva', eva_oof_path)
+
+        if edg_oof_path and os.path.exists(edg_oof_path):
+            self._load_fold_mapping('edg', edg_oof_path)
+
+        # Old model doesn't have fold structure in current implementation
+        # but we keep this for future extensibility
+
+        self.logger.info(f"DataLeakageChecker initialized with {len(self.eva_fold_map)} EVA samples, "
+                         f"{len(self.edg_fold_map)} EdgeNext samples")
+
+    def _load_fold_mapping(self, model_type, oof_path):
+        """Load isic_id -> fold_n mapping from OOF parquet files"""
+        try:
+            oof_df = pd.read_parquet(oof_path)
+
+            # Create mapping: isic_id -> fold_n
+            fold_map = dict(zip(oof_df['isic_id'], oof_df['fold_n']))
+
+            if model_type == 'eva':
+                self.eva_fold_map = fold_map
+            elif model_type == 'edg':
+                self.edg_fold_map = fold_map
+
+            self.logger.info(f"Loaded {len(fold_map)} {model_type} fold mappings from {oof_path}")
+
+        except Exception as e:
+            self.logger.warning(f"Could not load fold mapping for {model_type} from {oof_path}: {e}")
+
+    def get_oof_fold(self, isic_id, model_type):
+        """
+        Get the fold number where this sample was out-of-fold (validation) for the given model type.
+        Returns None if sample not found (backward compatibility).
+        """
+        if model_type == 'eva':
+            return self.eva_fold_map.get(isic_id)
+        elif model_type == 'edg':
+            return self.edg_fold_map.get(isic_id)
+        elif model_type == 'old':
+            return self.old_fold_map.get(isic_id)
+        else:
+            return None
+
+    def is_sample_in_training_fold(self, isic_id, model_type, fold_n):
+        """
+        Check if a sample was used for training a specific fold model.
+        Returns True if the sample was in training, False if it was OOF, None if not found.
+        """
+        oof_fold = self.get_oof_fold(isic_id, model_type)
+
+        if oof_fold is None:
+            return None  # Sample not found, backward compatibility
+
+        # Sample was in training for all folds except its OOF fold
+        return fold_n != oof_fold
+
+    def get_valid_models_for_sample(self, isic_id, model_type):
+        """
+        Get list of fold models that are safe to use for this sample (i.e., where sample was OOF).
+        Returns None if sample not found (use all models for backward compatibility).
+        """
+        oof_fold = self.get_oof_fold(isic_id, model_type)
+
+        if oof_fold is None:
+            return None  # Backward compatibility - use all models
+
+        return [oof_fold]  # Only use the fold where this sample was OOF
+
+    def should_prevent_leakage(self):
+        """Check if data leakage prevention is enabled and fold mappings are available"""
+        return (Config.prevent_data_leakage
+                and (len(self.eva_fold_map) > 0 or len(self.edg_fold_map) > 0))
+
+    def log_leakage_prevention_summary(self, samples_to_check):
+        """Log detailed information about data leakage prevention for debugging"""
+        if not Config.prevent_data_leakage:
+            return
+
+        self.logger.info("=" * 60)
+        self.logger.info("DATA LEAKAGE PREVENTION SUMMARY")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Config.prevent_data_leakage: {Config.prevent_data_leakage}")
+        self.logger.info(f"EVA fold mappings available: {len(self.eva_fold_map)} samples")
+        self.logger.info(f"EdgeNext fold mappings available: {len(self.edg_fold_map)} samples")
+
+        if samples_to_check:
+            eva_coverage = sum(1 for s in samples_to_check if s in self.eva_fold_map)
+            edg_coverage = sum(1 for s in samples_to_check if s in self.edg_fold_map)
+
+            self.logger.info(f"Samples to process: {len(samples_to_check)}")
+            self.logger.info(f"EVA coverage: {eva_coverage}/{len(samples_to_check)} ({100 * eva_coverage / len(samples_to_check):.1f}%)")
+            self.logger.info(f"EdgeNext coverage: {edg_coverage}/{len(samples_to_check)} ({100 * edg_coverage / len(samples_to_check):.1f}%)")
+
+            # Show fold distribution for EVA
+            eva_folds = [self.eva_fold_map[s] for s in samples_to_check if s in self.eva_fold_map]
+            if eva_folds:
+                fold_counts = pd.Series(eva_folds).value_counts().sort_index()
+                self.logger.info(f"EVA fold distribution: {dict(fold_counts)}")
+
+            # Show fold distribution for EdgeNext
+            edg_folds = [self.edg_fold_map[s] for s in samples_to_check if s in self.edg_fold_map]
+            if edg_folds:
+                fold_counts = pd.Series(edg_folds).value_counts().sort_index()
+                self.logger.info(f"EdgeNext fold distribution: {dict(fold_counts)}")
+
+        self.logger.info("=" * 60)
+
+
 # ============================================================================
 # ADDITIONAL FEATURE ENGINEERING
 # ============================================================================
@@ -644,8 +1120,34 @@ class OOFNormalizer:
 
 def add_lof_features(df, features):
     """Add Local Outlier Factor scores"""
+    from sklearn.impute import SimpleImputer
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    # Replace NaN patient_ids with isic_ids to avoid large NaN groups
+    nan_patient_count = df['patient_id'].isna().sum()
+    if nan_patient_count > 0:
+        logger.warning(f"Found {nan_patient_count} lesions with missing patient_id, using isic_id as fallback")
+        df.loc[df['patient_id'].isna(), 'patient_id'] = df.loc[df['patient_id'].isna()].index
+
+    # Check for NaN values in LOF features and log details
+    nan_info = []
+    for feature in features:
+        if feature in df.columns:
+            nan_count = df[feature].isna().sum()
+            if nan_count > 0:
+                nan_info.append(f"{feature}: {nan_count} NaN values")
+
+    if nan_info:
+        logger.warning(f"Found NaN values in LOF features before imputation: {', '.join(nan_info)}")
+
+    # Handle NaN values in features before scaling
+    imputer = SimpleImputer(strategy='median')
+    features_imputed = imputer.fit_transform(df[features])
+
     scaler = StandardScaler()
-    scaled_array = scaler.fit_transform(df[features])
+    scaled_array = scaler.fit_transform(features_imputed)
     outlier_factors = []
 
     for patient_id in tqdm(df.patient_id.unique()):
@@ -817,6 +1319,71 @@ class GradientBoostingPipeline:
 
         return final_predictions
 
+    def save_models(self, save_dir, encoder=None, feature_cols=None, columns_to_drop=None):
+        """Save all trained models and metadata for inference"""
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        LOGGER.info(f"Saving models to {save_dir}")
+
+        # Save each model type
+        for model_type in ['lgb', 'cb', 'xgb']:
+            model_dir = save_dir / model_type
+            model_dir.mkdir(exist_ok=True)
+
+            for i, model in enumerate(self.models[model_type]):
+                model_path = model_dir / f"model_{i}.pkl"
+                joblib.dump(model, model_path)
+
+            LOGGER.info(f"Saved {len(self.models[model_type])} {model_type} models")
+
+        # Save metadata for inference
+        metadata = {
+            'feature_cols': feature_cols,
+            'columns_to_drop': columns_to_drop,
+            'model_counts': {k: len(v) for k, v in self.models.items()},
+            'run_tags': Config.run_tags
+        }
+
+        with open(save_dir / 'metadata.pkl', 'wb') as f:
+            pickle.dump(metadata, f)
+
+        # Save encoder
+        if encoder is not None:
+            joblib.dump(encoder, save_dir / 'encoder.pkl')
+
+        LOGGER.info(f"Model saving completed. Metadata saved to {save_dir / 'metadata.pkl'}")
+
+    @classmethod
+    def load_models(cls, save_dir):
+        """Load all trained models and metadata for inference"""
+        save_dir = Path(save_dir)
+
+        # Load metadata
+        with open(save_dir / 'metadata.pkl', 'rb') as f:
+            metadata = pickle.load(f)
+
+        # Create pipeline instance
+        pipeline = cls({'lgb': {}, 'cb': {}, 'xgb': {}})  # Empty params since we're loading
+
+        # Load models
+        for model_type in ['lgb', 'cb', 'xgb']:
+            model_dir = save_dir / model_type
+            pipeline.models[model_type] = []
+
+            for i in range(metadata['model_counts'][model_type]):
+                model_path = model_dir / f"model_{i}.pkl"
+                model = joblib.load(model_path)
+                pipeline.models[model_type].append(model)
+
+        # Load encoder
+        encoder = None
+        encoder_path = save_dir / 'encoder.pkl'
+        if encoder_path.exists():
+            encoder = joblib.load(encoder_path)
+
+        return pipeline, metadata, encoder
+
 
 def clean_data(df, feature_cols, data_type=""):
     """Clean data by handling inf values and missing values"""
@@ -865,12 +1432,18 @@ def clean_data(df, feature_cols, data_type=""):
 
 
 def main():
+    # Initialize logger with Config tags
+    global LOGGER
+    LOGGER = setup_logging(Config.run_tags)
+
     LOGGER.info("ISIC 2024 First Place Solution")
     LOGGER.info("=" * 50)
 
     # Load and engineer features
     LOGGER.info("\n1. Loading and engineering features...")
+    LOGGER.info("Engineering training features...")
     df_train = engineer_features(pl.read_csv(Config.train_path))
+    LOGGER.info("Engineering test features...")
     df_test = engineer_features(pl.read_csv(Config.test_path))
     # df_subm = pd.read_csv(Config.subm_path, index_col=Config.id_col)
 
@@ -890,38 +1463,36 @@ def main():
         if df_train[col].dtype != 'object' and col != Config.target_col
     ]
 
-    # Load deep learning features
-    LOGGER.info("\n3. Loading deep learning features...")
+    # Initialize data leakage checker
+    leakage_checker = None
+    if Config.prevent_data_leakage:
+        LOGGER.info("\n3a. Initializing data leakage prevention system...")
+        leakage_checker = DataLeakageChecker(
+            eva_oof_path=Config.eva_oof_path,
+            edg_oof_path=Config.edg_oof_path
+        )
 
-    # Load pre-computed training features
-    df_train = load_training_dl_features(df_train)
+        # Log detailed summary for debugging
+        train_samples = df_train.index.tolist() if hasattr(df_train, 'index') else df_train[Config.id_col].tolist()
+        test_samples = df_test.index.tolist() if hasattr(df_test, 'index') else df_test[Config.id_col].tolist()
+        all_samples = train_samples + test_samples
+        leakage_checker.log_leakage_prevention_summary(all_samples)
 
-    # Extract test features
-    test_dl_features = extract_dl_features(df_test.reset_index(), Config.test_h5)
-    df_test = df_test.merge(test_dl_features[['isic_id', 'old_set_0', 'old_set_1', 'old_set_2',
-                                             'predictions_eva', 'predictions_edg']],
-                            on='isic_id', how='left')
+    # Load training deep learning features only
+    LOGGER.info("\n3. Loading training deep learning features...")
+    df_train = load_training_dl_features(df_train, leakage_checker)
 
-    # Add patient normalizations for test DL features
-    df_test = add_patient_norm(df_test, 'old_set_0', 'old_set_0_m')
-    df_test = add_patient_norm(df_test, 'old_set_1', 'old_set_1_m')
-    df_test = add_patient_norm(df_test, 'old_set_2', 'old_set_2_m')
-    df_test = add_patient_norm(df_test, 'predictions_eva', 'predictions_eva_m')
-    df_test = add_patient_norm(df_test, 'predictions_edg', 'predictions_edg_m')
-
-    # Update feature columns with new features
+    # Update feature columns with new DL features (for training only initially)
     dl_features = ['old_set_0', 'old_set_1', 'old_set_2', 'old_set_0_m', 'old_set_1_m', 'old_set_2_m',
                    'predictions_eva', 'predictions_eva_m', 'predictions_edg', 'predictions_edg_m']
     feature_cols.extend(dl_features)
 
-    LOGGER.info("\n4. Cleaning data...")
+    LOGGER.info("\n4. Cleaning training data...")
     df_train = clean_data(df_train, feature_cols, "training")
-    df_test = clean_data(df_test, feature_cols, "test")
 
-    # Add LOF features (after cleaning data to remove NaN values)
-    LOGGER.info("\n5. Adding Local Outlier Factor features...")
+    # Add LOF features for training data
+    LOGGER.info("\n5. Adding Local Outlier Factor features to training data...")
     df_train = add_lof_features(df_train, Config.lof_features)
-    df_test = add_lof_features(df_test, Config.lof_features)
 
     # Add 'of' feature to feature columns
     feature_cols.append('of')
@@ -986,8 +1557,36 @@ def main():
     # Note: In production, you would load pre-trained models here
     gb_pipeline.train_models(df_train, feature_cols, new_cat_cols, Config.columns_to_drop)
 
+    # Save trained models for inference
+    LOGGER.info("\n6a. Saving trained models...")
+    gb_pipeline.save_models(
+        save_dir=Config.model_save_dir,
+        encoder=encoder,
+        feature_cols=feature_cols,
+        columns_to_drop=Config.columns_to_drop
+    )
+
+    # Now extract test features (after training is complete)
+    LOGGER.info("\n7. Extracting test deep learning features...")
+    test_dl_features = extract_dl_features(df_test.reset_index(), Config.test_h5, leakage_checker)
+    df_test = df_test.merge(test_dl_features[['isic_id', 'old_set_0', 'old_set_1', 'old_set_2',
+                                             'predictions_eva', 'predictions_edg']],
+                            on='isic_id', how='left')
+
+    # Add patient normalizations for test DL features
+    df_test = add_patient_norm(df_test, 'old_set_0', 'old_set_0_m')
+    df_test = add_patient_norm(df_test, 'old_set_1', 'old_set_1_m')
+    df_test = add_patient_norm(df_test, 'old_set_2', 'old_set_2_m')
+    df_test = add_patient_norm(df_test, 'predictions_eva', 'predictions_eva_m')
+    df_test = add_patient_norm(df_test, 'predictions_edg', 'predictions_edg_m')
+
+    # Clean test data and add LOF features
+    LOGGER.info("\n8. Processing test data...")
+    df_test = clean_data(df_test, feature_cols, "test")
+    df_test = add_lof_features(df_test, Config.lof_features)
+
     # Generate predictions
-    LOGGER.info("\n7. Generating final predictions...")
+    LOGGER.info("\n9. Generating final predictions...")
     predictions = gb_pipeline.predict(df_test, feature_cols, columns_to_drop=Config.columns_to_drop)
 
     # Save submission
@@ -997,10 +1596,11 @@ def main():
         'prediction': predictions
     })
     df_subm.set_index(Config.id_col, inplace=True)
-    df_subm.to_csv('submission.csv')
+    submission_filename = f'submission_{Config.run_tags}.csv'
+    df_subm.to_csv(submission_filename)
 
     auc_score = custom_metric(df_subm["prediction"], df_subm["target"])
-    LOGGER.info("\nSubmission saved to submission.csv")
+    LOGGER.info(f"\nSubmission saved to {submission_filename}")
     LOGGER.info(f"\nAUROC Score: {auc_score}")
     LOGGER.info(f"Shape: {df_subm.shape}")
     LOGGER.info(df_subm.head())
